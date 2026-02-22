@@ -17,6 +17,13 @@ SERVER_IP=""
 MIRROR_BASE=""
 PVE_REPO_COMPONENT=""
 PVE_GPG_KEY_URL=""
+STATE_DIR="/var/lib/pve-install"
+
+function ensure_state_dir() {
+    if [[ ! -d "$STATE_DIR" ]]; then
+        mkdir -p "$STATE_DIR" || true
+    fi
+}
 
 log_info() { printf "${COLOR_GREEN}[INFO]${COLOR_NC} %s\n" "$1"; }
 log_warn() { printf "${COLOR_YELLOW}[WARN]${COLOR_NC} %s\n" "$1"; }
@@ -154,6 +161,45 @@ function configure_architecture_specifics() {
     log_info "GPG密钥地址已设置为: ${PVE_GPG_KEY_URL}"
 }
 
+function download_keyring_to() {
+    local dest="$1"; shift
+    local urls=("$@")
+    local tmp="${dest}.tmp"
+    local ok=1
+
+    for u in "${urls[@]}"; do
+        if curl -fsSL "$u" -o "$tmp"; then
+            ok=0; break
+        fi
+        if command -v wget &>/dev/null; then
+            if wget --no-check-certificate -qO "$tmp" "$u"; then
+                ok=0; break
+            fi
+        fi
+    done
+
+    if [[ $ok -ne 0 ]]; then
+        return 1
+    fi
+    mv "$tmp" "$dest"
+    chmod 644 "$dest"
+    return 0
+}
+
+function write_deb822_source() {
+    local dest="/etc/apt/sources.list.d/pve-install-repo.sources"
+    ensure_state_dir
+    log_step "写入 deb822 格式的 Proxmox APT 源到 ${dest}"
+    cat > "$dest" <<EOF
+Types: deb
+URIs: ${MIRROR_BASE}
+Suites: ${DEBIAN_CODENAME}
+Components: ${PVE_REPO_COMPONENT}
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring-${DEBIAN_CODENAME}.gpg
+EOF
+    log_info "已写入: $dest"
+}
+
 function configure_hostname() {
     log_step "配置主机名和 /etc/hosts 文件"
     
@@ -234,35 +280,96 @@ function backup_apt_config() {
 }
 
 function run_installation() {
-    log_step "开始安装 Proxmox VE"
-    
-    log_info "正在下载 Proxmox GPG 密钥..."
-    local gpg_key_name
-    gpg_key_name=$(basename "$PVE_GPG_KEY_URL")
-    if ! curl -fsSL "${PVE_GPG_KEY_URL}" -o "/etc/apt/trusted.gpg.d/${gpg_key_name}"; then
-        log_error "GPG 密钥下载失败。请检查网络连接或源地址是否可用。"
-        exit 1
-    fi
-    chmod 644 "/etc/apt/trusted.gpg.d/${gpg_key_name}"
-    log_info "GPG 密钥安装成功。"
+    log_step "开始安装 Proxmox VE (遵循官方推荐步骤)"
+    ensure_state_dir
 
-    log_info "正在配置 Proxmox VE 的 APT 源..."
-    echo "deb ${MIRROR_BASE} ${DEBIAN_CODENAME} ${PVE_REPO_COMPONENT}" > /etc/apt/sources.list.d/pve.list
-    
-    log_info "正在更新软件包列表 (apt-get update)..."
-    if ! apt-get update; then
-        log_error "软件包列表更新失败。请检查您的网络和 APT 配置。"
+    # 下载并安装 keyring 到 /usr/share/keyrings
+    local key_dest="/usr/share/keyrings/proxmox-archive-keyring-${DEBIAN_CODENAME}.gpg"
+    log_info "正在下载 Proxmox APT 存档密钥到 ${key_dest}..."
+
+    # 优先尝试 enterprise，然后 download，再尝试之前的 PVE_GPG_KEY_URL
+    local urls=(
+        "https://enterprise.proxmox.com/debian/proxmox-archive-keyring-${DEBIAN_CODENAME}.gpg"
+        "https://download.proxmox.com/debian/proxmox-archive-keyring-${DEBIAN_CODENAME}.gpg"
+        "${PVE_GPG_KEY_URL}"
+    )
+
+    if ! download_keyring_to "$key_dest" "${urls[@]}"; then
+        log_error "无法下载 Proxmox keyring。请检查网络或手动将 key 文件放置到 ${key_dest}。"
         exit 1
     fi
-    
-    log_info "正在安装 Proxmox VE 核心包... 这可能需要一些时间。"
+    log_info "密钥已安装到: ${key_dest}"
+
+    # 使用 deb822 写入新的 .sources 文件（Signed-By 指向上面 keyring）
+    write_deb822_source
+
+    # 可选：将现有 sources 迁移为 modernize 格式（如果支持）
+    if command -v apt &>/dev/null; then
+        if apt --help 2>&1 | grep -q "modernize-sources"; then
+            log_info "检测到 apt modernize-sources，正在尝试迁移现有 sources（如果需要）。"
+            apt modernize-sources || log_warn "apt modernize-sources 运行失败或无需迁移。"
+        fi
+    fi
+
+    log_info "更新并升级系统包 (apt update && apt full-upgrade)..."
+    if ! apt update || ! apt -y full-upgrade; then
+        log_error "apt 更新或升级失败。请检查网络和 APT 配置。"
+        exit 1
+    fi
+
     export DEBIAN_FRONTEND=noninteractive
-    if ! apt-get install -y proxmox-ve postfix open-iscsi; then
-        log_error "Proxmox VE 安装失败。请检查上面的错误信息以诊断问题。"
-        exit 1
+
+    local kernel_flag_file="${STATE_DIR}/kernel_installed"
+    local packages_flag_file="${STATE_DIR}/packages_installed"
+
+    if [[ ! -f "$kernel_flag_file" ]]; then
+        log_info "安装 Proxmox VE 推荐内核 (proxmox-default-kernel)。"
+        if ! apt install -y proxmox-default-kernel; then
+            log_error "安装 proxmox-default-kernel 失败。"
+            exit 1
+        fi
+        touch "$kernel_flag_file"
+        log_info "Proxmox 内核已安装。为使新内核生效，建议现在重启系统。"
+        read -p "是否立即重启系统以加载 Proxmox 内核？(y/N): " reboot_now
+        if [[ "${reboot_now,,}" == "y" ]]; then
+            log_info "系统将在 5 秒后重启..."
+            sleep 5
+            reboot
+        else
+            log_warn "请手动重启系统后重新运行脚本以继续安装剩余的 Proxmox 包。"
+            exit 0
+        fi
     fi
 
-    log_info "Proxmox VE 核心组件安装成功！"
+    # 继续安装 Proxmox VE 软件包（在内核生效后运行）
+    if [[ -f "$kernel_flag_file" && ! -f "$packages_flag_file" ]]; then
+        log_info "安装 Proxmox VE 包: proxmox-ve, postfix, open-iscsi, chrony"
+        if ! apt install -y proxmox-ve postfix open-iscsi chrony; then
+            log_error "安装 Proxmox VE 包失败。"
+            exit 1
+        fi
+
+        # 移除 Debian 默认 kernel（按官方建议）
+        log_info "尝试移除 Debian 默认内核包以避免未来升级问题。"
+        apt remove -y linux-image-amd64 'linux-image-6.12*' || log_warn "移除特定 kernel 包时出现问题，跳过。"
+
+        # 更新 grub（如果存在）
+        if command -v update-grub &>/dev/null; then
+            log_info "更新 grub 引导配置。"
+            update-grub || log_warn "update-grub 失败。"
+        fi
+
+        # 可选：移除 os-prober
+        read -p "是否移除 os-prober 包（推荐，防止 VM 分区被列入 grub）？(y/N): " remove_os
+        if [[ "${remove_os,,}" == "y" ]]; then
+            apt remove -y os-prober || log_warn "移除 os-prober 失败或未安装。"
+        fi
+
+        touch "$packages_flag_file"
+        log_info "Proxmox VE 包安装完成。"
+    fi
+
+    log_info "安装阶段完成。"
 }
 
 function show_completion_info() {
