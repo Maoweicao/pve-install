@@ -28,6 +28,35 @@ function cleanup_on_exit() {
     exit 1
 }
 
+function ensure_packages_installed() {
+    log_step "检查并安装缺失的基础软件包"
+    local pkgs=("curl" "wget" "gnupg2" "lsb-release" "ca-certificates" "apt-transport-https")
+    local missing=()
+
+    for pkg in "${pkgs[@]}"; do
+        if ! dpkg -s "$pkg" &>/dev/null; then
+            missing+=("$pkg")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_warn "检测到缺失的软件包: ${missing[*]}"
+        log_info "将尝试自动安装缺失的软件包 (apt-get update && apt-get install -y ...)。"
+        export DEBIAN_FRONTEND=noninteractive
+        if ! apt-get update; then
+            log_error "apt-get update 失败，无法安装缺失的软件包。"
+            exit 1
+        fi
+        if ! apt-get install -y "${missing[@]}"; then
+            log_error "自动安装缺失软件包失败: ${missing[*]}"
+            exit 1
+        fi
+        log_info "缺失的软件包已安装。"
+    else
+        log_info "所有基础软件包均已安装。"
+    fi
+}
+
 function check_prerequisites() {
     log_step "检查系统环境和依赖"
 
@@ -53,28 +82,8 @@ function check_prerequisites() {
     esac
     log_info "检测到系统架构: ${SYSTEM_ARCH}"
 
-    declare -A deps_map=(
-        ["curl"]="curl"
-        ["lsb_release"]="lsb-release"
-    )
-    local missing_pkgs=()
-
-    for cmd in "${!deps_map[@]}"; do
-        if ! command -v "$cmd" &>/dev/null; then
-            missing_pkgs+=("${deps_map[$cmd]}")
-        fi
-    done
-
-    if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
-        local missing_pkgs_str
-        missing_pkgs_str=$(printf " %s" "${missing_pkgs[@]}")
-        missing_pkgs_str=${missing_pkgs_str:1}
-
-        log_error "缺少必要的软件包: ${missing_pkgs_str}"
-        log_info "请尝试运行 'apt-get update && apt-get install -y ${missing_pkgs_str}' 来安装它们。"
-        exit 1
-    fi
-    log_info "所有依赖项均已满足。"
+    # 自动检查并安装 pve 官方脚本常用的基础依赖包
+    ensure_packages_installed
 }
 
 function check_debian_version() {
@@ -96,8 +105,12 @@ function check_debian_version() {
             PVE_VERSION="8"
             log_info "检测到 Debian 12 (Bookworm)，将准备安装 PVE $PVE_VERSION"
             ;;
+        trixie)
+            PVE_VERSION="9"
+            log_info "检测到 Debian 13 (Trixie)，将准备安装 PVE $PVE_VERSION"
+            ;;
         *)
-            log_error "不支持的 Debian 版本: $DEBIAN_CODENAME (仅支持 bullseye 和 bookworm)"
+            log_error "不支持的 Debian 版本: $DEBIAN_CODENAME (仅支持 bullseye、bookworm 和 trixie)"
             exit 1
             ;;
     esac
@@ -107,10 +120,10 @@ function configure_architecture_specifics() {
     log_step "根据架构 (${SYSTEM_ARCH}) 配置软件源"
 
     if [[ "$SYSTEM_ARCH" == "amd64" ]]; then
-        log_info "为 AMD64 架构使用 Proxmox 官方软件源。"
-        MIRROR_BASE="http://download.proxmox.com/debian/pve"
+        log_info "为 AMD64 架构使用 Proxmox 官方公共下载源 (无订阅)。"
+        MIRROR_BASE="https://download.proxmox.com/debian/pve"
         PVE_REPO_COMPONENT="pve-no-subscription"
-        PVE_GPG_KEY_URL="https://enterprise.proxmox.com/debian/proxmox-release-${DEBIAN_CODENAME}.gpg"
+        PVE_GPG_KEY_URL="https://download.proxmox.com/debian/proxmox-release-${DEBIAN_CODENAME}.gpg"
     else
         # 修正之处：为 ARM64 单独处理 URL，确保路径正确
         log_info "为 ARM64 架构选择第三方镜像源。"
