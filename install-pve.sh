@@ -186,6 +186,35 @@ function download_keyring_to() {
     return 0
 }
 
+function find_available_mirrors() {
+    # 返回可用的 keyring URL 列表（每行一个）
+    local bases=(
+        "https://enterprise.proxmox.com"
+        "https://download.proxmox.com"
+        "https://mirrors.apqa.cn/proxmox"
+        "https://mirrors.lierfang.com/proxmox"
+        "https://hk.mirrors.apqa.cn/proxmox"
+        "https://de.mirrors.apqa.cn/proxmox"
+    )
+
+    local filename="proxmox-archive-keyring-${DEBIAN_CODENAME}.gpg"
+    local url
+    for base in "${bases[@]}"; do
+        # 可能的完整路径
+        url="${base}/debian/${filename}"
+        if curl -fsS --head "$url" -o /dev/null; then
+            printf "%s\n" "$url"
+            continue
+        fi
+        # 有些镜像使用不同路径（兼容性尝试）
+        url="${base}/${filename}"
+        if curl -fsS --head "$url" -o /dev/null; then
+            printf "%s\n" "$url"
+            continue
+        fi
+    done
+}
+
 function write_deb822_source() {
     local dest="/etc/apt/sources.list.d/pve-install-repo.sources"
     ensure_state_dir
@@ -287,12 +316,27 @@ function run_installation() {
     local key_dest="/usr/share/keyrings/proxmox-archive-keyring-${DEBIAN_CODENAME}.gpg"
     log_info "正在下载 Proxmox APT 存档密钥到 ${key_dest}..."
 
-    # 优先尝试 enterprise，然后 download，再尝试之前的 PVE_GPG_KEY_URL
-    local urls=(
+    # 先探测可用镜像地址
+    mapfile -t candidate_urls < <(find_available_mirrors)
+
+    # 将优先级放在 enterprise 和 download，后面追加探测到的镜像（去重）
+    local prefer=(
         "https://enterprise.proxmox.com/debian/proxmox-archive-keyring-${DEBIAN_CODENAME}.gpg"
         "https://download.proxmox.com/debian/proxmox-archive-keyring-${DEBIAN_CODENAME}.gpg"
-        "${PVE_GPG_KEY_URL}"
     )
+
+    # 构建最终 URL 列表
+    local urls=()
+    local u
+    for u in "${prefer[@]}"; do urls+=("$u"); done
+    for u in "${candidate_urls[@]}"; do
+        # 防止重复
+        local found=0
+        for _v in "${urls[@]}"; do [[ "$_v" == "$u" ]] && found=1 && break; done
+        [[ $found -eq 0 ]] && urls+=("$u")
+    done
+    # 额外将脚本已有 PVE_GPG_KEY_URL 置于备选
+    urls+=("${PVE_GPG_KEY_URL}")
 
     if ! download_keyring_to "$key_dest" "${urls[@]}"; then
         log_error "无法下载 Proxmox keyring。请检查网络或手动将 key 文件放置到 ${key_dest}。"
